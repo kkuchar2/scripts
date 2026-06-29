@@ -483,60 +483,89 @@ def soft_severities(findings: list[AuditFinding]) -> list[AuditFinding]:
     return [f for f in findings if f.severity in bad]
 
 
+@dataclass
+class PeerConflict:
+    child: str
+    required_range: str
+    parent: str
+    parent_version: str | None = None
+
+
+# Scoped or unscoped package name
+_PKG = r"(?:@[^/\s]+/[^\s@]+|[^/\s@][^\s@]*)"
+
 ERESOLVE_RE = re.compile(
-    r"Could not resolve dependency:\s+"
-    r"(?P<parent>[^\s]+)\s+"
-    r"(?:requires|peer requires)\s+"
-    r"(?P<child>[^\s]+)\s+"
-    r"(?P<range>\S+)",
+    rf"(?:Could not resolve dependency:\s+)?"
+    rf"(?P<parent>{_PKG})\s+"
+    rf"(?:requires|peer requires)\s+"
+    rf"(?P<child>{_PKG})\s+"
+    rf"(?P<range>\"[^\"]+\"|\S+)",
     re.IGNORECASE,
 )
 
-MISSING_PEER_RE = re.compile(
-    r"peer (?P<child>[^\s]+)@(?P<range>[^\s]+) from (?P<parent>[^\s]+)",
+PEER_FROM_RE = re.compile(
+    rf"peer (?:optional )?(?P<child>{_PKG})@(?P<range>\"[^\"]+\"|\S+)"
+    rf" from (?P<parent>{_PKG})(?:@(?P<parent_ver>\S+))?",
+    re.IGNORECASE,
+)
+
+FOUND_RE = re.compile(
+    rf"Found: (?P<child>{_PKG})@(?P<version>\S+)",
     re.IGNORECASE,
 )
 
 LEGACY_PEER_SUGGESTION_RE = re.compile(r"legacy-peer-deps", re.IGNORECASE)
 
-PEER_PARENT_RE = re.compile(
-    r"peer (?P<child>[^\s]+)@(?P<range>[^\s]+) from (?P<parent>[^\s@]+)",
+WHILE_RESOLVING_RE = re.compile(
+    rf"While resolving: (?P<parent>{_PKG})@",
     re.IGNORECASE,
 )
 
 
-def extract_install_hints(output: str) -> list[tuple[str, str]]:
-    """Return list of (package, suggested_version) from npm error output."""
-    if LEGACY_PEER_SUGGESTION_RE.search(output):
-        die(
-            "npm suggested --legacy-peer-deps. This script never uses that flag. "
-            "Fix peer conflicts by upgrading the parent package or adding overrides."
+def strip_range(range_spec: str) -> str:
+    s = range_spec.strip()
+    if s.startswith('"') and s.endswith('"'):
+        return s[1:-1]
+    return s
+
+
+def parse_peer_conflicts(output: str) -> tuple[list[PeerConflict], dict[str, str]]:
+    """Parse npm ERESOLVE output into peer conflicts and installed versions."""
+    conflicts: list[PeerConflict] = []
+    seen: set[tuple[str, str, str]] = set()
+    found_versions: dict[str, str] = {}
+
+    for m in FOUND_RE.finditer(output):
+        found_versions[m.group("child")] = m.group("version").rstrip(",")
+
+    for m in PEER_FROM_RE.finditer(output):
+        key = (m.group("child"), strip_range(m.group("range")), m.group("parent"))
+        if key in seen:
+            continue
+        seen.add(key)
+        conflicts.append(
+            PeerConflict(
+                child=m.group("child"),
+                required_range=strip_range(m.group("range")),
+                parent=m.group("parent"),
+                parent_version=m.group("parent_ver"),
+            )
         )
 
-    hints: list[tuple[str, str]] = []
     for m in ERESOLVE_RE.finditer(output):
-        child = m.group("child")
-        range_spec = m.group("range").strip('"')
-        ver = resolve_version_from_range(child, range_spec)
-        if ver:
-            hints.append((child, ver))
-    for m in MISSING_PEER_RE.finditer(output):
-        child = m.group("child")
-        range_spec = m.group("range")
-        ver = resolve_version_from_range(child, range_spec)
-        if ver:
-            hints.append((child, ver))
-    return hints
+        key = (m.group("child"), strip_range(m.group("range")), m.group("parent"))
+        if key in seen:
+            continue
+        seen.add(key)
+        conflicts.append(
+            PeerConflict(
+                child=m.group("child"),
+                required_range=strip_range(m.group("range")),
+                parent=m.group("parent"),
+            )
+        )
 
-
-def extract_peer_parents(output: str) -> list[str]:
-    """Packages that declare unsatisfied peer deps (candidates to upgrade)."""
-    parents: list[str] = []
-    for m in PEER_PARENT_RE.finditer(output):
-        parent = m.group("parent")
-        if parent not in parents:
-            parents.append(parent)
-    return parents
+    return conflicts, found_versions
 
 
 def dep_sections(pkg: dict[str, Any]) -> list[str]:
@@ -545,6 +574,141 @@ def dep_sections(pkg: dict[str, Any]) -> list[str]:
         for k in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
         if k in pkg and isinstance(pkg[k], dict)
     ]
+
+
+def is_direct_dep(pkg: dict[str, Any], name: str) -> str | None:
+    for section in dep_sections(pkg):
+        if name in pkg[section]:
+            return section
+    return None
+
+
+def upgrade_package(pkg: dict[str, Any], name: str) -> bool:
+    """Bump a direct dep or add an override for a transitive package."""
+    latest = npm_view_latest(name)
+    if not latest:
+        return False
+    if is_direct_dep(pkg, name):
+        return bump_direct_dependency(pkg, name, f"^{latest}")
+    return set_override(pkg, name, latest)
+
+
+def satisfy_peer_range(pkg: dict[str, Any], child: str, range_spec: str) -> bool:
+    """Pin child to the newest version that satisfies the peer range."""
+    version = resolve_version_from_range(child, range_spec)
+    if not version:
+        return False
+    if is_direct_dep(pkg, child):
+        return bump_direct_dependency(pkg, child, version)
+    return set_override(pkg, child, version)
+
+
+def extract_install_hints(output: str) -> list[tuple[str, str]]:
+    """Return list of (package, suggested_version) from npm error output."""
+    hints: list[tuple[str, str]] = []
+    for m in ERESOLVE_RE.finditer(output):
+        child = m.group("child")
+        range_spec = strip_range(m.group("range"))
+        ver = resolve_version_from_range(child, range_spec)
+        if ver:
+            hints.append((child, ver))
+    return hints
+
+
+def version_satisfies_range(package: str, version: str, range_spec: str) -> bool:
+    """True when `version` is among versions npm resolves for package@range."""
+    result = run_npm(
+        "view", f"{package}@{range_spec}", "version", "--json", check=False, strict=False
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    try:
+        parsed = json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return False
+    versions = {str(v) for v in (parsed if isinstance(parsed, list) else [parsed])}
+    return version in versions
+
+
+def collect_packages_to_upgrade(output: str) -> list[str]:
+    """Best-effort extraction of package names worth upgrading from npm output."""
+    names: list[str] = []
+    for pattern in (PEER_FROM_RE, WHILE_RESOLVING_RE):
+        for m in pattern.finditer(output):
+            for group in ("parent", "child"):
+                if group in m.groupdict() and m.group(group):
+                    name = m.group(group)
+                    if name not in names:
+                        names.append(name)
+    return names
+
+
+def try_resolve_peer_conflicts(pkg: dict[str, Any], output: str) -> bool:
+    """
+    Resolve peer dependency failures without legacy-peer-deps:
+      1. Upgrade the parent package (direct bump or transitive override).
+      2. Pin the peer child to a version satisfying the declared range.
+      3. Fall back to generic ERESOLVE hints.
+    """
+    if LEGACY_PEER_SUGGESTION_RE.search(output):
+        log(
+            "npm mentioned --legacy-peer-deps in its error text (ignored); "
+            "attempting real fixes via upgrades and overrides",
+            level="warn",
+        )
+
+    changed = False
+    conflicts, found_versions = parse_peer_conflicts(output)
+
+    for conflict in conflicts:
+        log(
+            f"peer conflict: {conflict.parent} needs "
+            f"{conflict.child}@{conflict.required_range}"
+        )
+        # Prefer upgrading the package that declares the outdated peer range.
+        if upgrade_package(pkg, conflict.parent):
+            changed = True
+            continue
+
+        found = found_versions.get(conflict.child)
+        if found and version_satisfies_range(
+            conflict.child, found, conflict.required_range
+        ):
+            # Installed version is valid; parent is too old to accept it.
+            if upgrade_package(pkg, conflict.parent):
+                changed = True
+            continue
+
+        if found and is_direct_dep(pkg, conflict.child):
+            # Root pins a newer peer than the parent allows — upgrade the parent.
+            if upgrade_package(pkg, conflict.parent):
+                changed = True
+            continue
+
+        # Parent may already be latest — pin the peer to satisfy the range.
+        if satisfy_peer_range(pkg, conflict.child, conflict.required_range):
+            changed = True
+
+    if not changed and conflicts:
+        # All parents may already be at latest; try satisfying each peer range.
+        for conflict in conflicts:
+            if satisfy_peer_range(pkg, conflict.child, conflict.required_range):
+                changed = True
+
+    if not changed:
+        for name in collect_packages_to_upgrade(output):
+            if upgrade_package(pkg, name):
+                changed = True
+
+    if not changed:
+        for name, version in dict(extract_install_hints(output)).items():
+            if is_direct_dep(pkg, name):
+                if bump_direct_dependency(pkg, name, version):
+                    changed = True
+            elif set_override(pkg, name, version):
+                changed = True
+
+    return changed
 
 
 def bump_direct_dependency(pkg: dict[str, Any], name: str, version: str) -> bool:
@@ -556,27 +720,6 @@ def bump_direct_dependency(pkg: dict[str, Any], name: str, version: str) -> bool
             log(f"bump {section}.{name}: {deps[name]} → {version}")
             deps[name] = version
             changed = True
-    return changed
-
-
-def try_resolve_peer_conflicts(pkg: dict[str, Any], output: str) -> bool:
-    """
-    Resolve peer dependency failures without legacy-peer-deps:
-      1. Pin peer packages via overrides to a version satisfying the declared range.
-      2. Upgrade parent packages that declare outdated peer ranges.
-    """
-    changed = False
-
-    hints = extract_install_hints(output)
-    for name, version in dict(hints).items():
-        if set_override(pkg, name, version):
-            changed = True
-
-    for parent in extract_peer_parents(output):
-        latest = npm_view_latest(parent)
-        if latest and bump_direct_dependency(pkg, parent, f"^{latest}"):
-            changed = True
-
     return changed
 
 
